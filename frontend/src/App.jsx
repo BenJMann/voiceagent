@@ -24,6 +24,48 @@ const base64ToArrayBuffer = (base64) => {
   return buffer;
 };
 
+const extractPcmFromWav = (arrayBuffer) => {
+  if (!arrayBuffer || arrayBuffer.byteLength < 44) {
+    return arrayBuffer;
+  }
+  const view = new DataView(arrayBuffer);
+  const riff = String.fromCharCode(
+    view.getUint8(0),
+    view.getUint8(1),
+    view.getUint8(2),
+    view.getUint8(3)
+  );
+  const wave = String.fromCharCode(
+    view.getUint8(8),
+    view.getUint8(9),
+    view.getUint8(10),
+    view.getUint8(11)
+  );
+
+  if (riff !== 'RIFF' || wave !== 'WAVE') {
+    return arrayBuffer;
+  }
+
+  let offset = 12;
+  while (offset + 8 <= view.byteLength) {
+    const chunkId = String.fromCharCode(
+      view.getUint8(offset),
+      view.getUint8(offset + 1),
+      view.getUint8(offset + 2),
+      view.getUint8(offset + 3)
+    );
+    const chunkSize = view.getUint32(offset + 4, true);
+    const dataStart = offset + 8;
+    if (chunkId === 'data') {
+      const end = Math.min(dataStart + chunkSize, view.byteLength);
+      return arrayBuffer.slice(dataStart, end);
+    }
+    offset += 8 + chunkSize + (chunkSize % 2);
+  }
+
+  return arrayBuffer;
+};
+
 export default function App() {
   const [isRecording, setIsRecording] = useState(false);
   const [interimText, setInterimText] = useState('');
@@ -181,16 +223,19 @@ export default function App() {
         case 'audio_chunk': {
           const audioContext = await ensurePlaybackContext();
           const arrayBuffer = base64ToArrayBuffer(payload.audio);
-          const encoding = payload.encoding || 'pcm_s16le';
+          const encoding = payload.encoding || 'pcm_f32le';
+          const container = payload.container || 'raw';
+          const decodedBuffer =
+            container === 'wav' ? extractPcmFromWav(arrayBuffer) : arrayBuffer;
           let float32;
           if (encoding === 'pcm_s16le') {
-            const int16 = new Int16Array(arrayBuffer);
+            const int16 = new Int16Array(decodedBuffer);
             float32 = new Float32Array(int16.length);
             for (let i = 0; i < int16.length; i += 1) {
               float32[i] = int16[i] / 0x7fff;
             }
           } else if (encoding === 'pcm_f32le') {
-            float32 = new Float32Array(arrayBuffer);
+            float32 = new Float32Array(decodedBuffer);
           } else {
             console.warn('Unsupported audio encoding from server', encoding);
             break;
