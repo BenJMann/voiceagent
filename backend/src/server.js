@@ -267,6 +267,18 @@ wss.on('connection', async (socket) => {
         );
       };
 
+      let completionResolved = false;
+      let resolveCompletion;
+      const completion = new Promise((resolve) => {
+        resolveCompletion = () => {
+          if (completionResolved) {
+            return;
+          }
+          completionResolved = true;
+          resolve();
+        };
+      });
+
       const forwardAudioChunk = (audioBuffer) => {
         if (!audioBuffer || !audioBuffer.length) {
           return;
@@ -281,6 +293,17 @@ wss.on('connection', async (socket) => {
         );
       };
 
+      const handleStreamErrorEvent = (error) => {
+        if (error) {
+          console.error('TTS stream error event', error);
+        }
+        resolveCompletion();
+      };
+
+      const handleStreamAbortEvent = () => {
+        resolveCompletion();
+      };
+
       const handlePayload = (payload) => {
         if (!payload) {
           return;
@@ -291,16 +314,14 @@ wss.on('connection', async (socket) => {
               type: 'audio_chunk',
               audio: payload.data,
               sampleRate: CARTESIA_TTS_SAMPLE_RATE,
-              encoding: 'pcm_s16le',
-            })
-          );
+            encoding: 'pcm_s16le',
+          })
+        );
         } else if (payload.done) {
-          emitAudioEnd();
-          stream.off('message', handleChunk);
+          resolveCompletion();
         } else if (payload.type === 'error') {
           console.error('TTS stream error', payload.message);
-          emitAudioEnd();
-          stream.off('message', handleChunk);
+          resolveCompletion();
         }
       };
 
@@ -335,9 +356,28 @@ wss.on('connection', async (socket) => {
       };
 
       stream.on('message', handleChunk);
-      await stream.once('close');
-      emitAudioEnd();
-      stream.off('message', handleChunk);
+      stream.on('error', handleStreamErrorEvent);
+      stream.on('abort', handleStreamAbortEvent);
+
+      const waitForSourceClose = stream.source && typeof stream.source.once === 'function'
+        ? stream.source.once('close')
+        : stream.once('close');
+
+      waitForSourceClose.then(resolveCompletion).catch((error) => {
+        if (error) {
+          console.error('TTS stream source close error', error);
+        }
+        resolveCompletion();
+      });
+
+      try {
+        await completion;
+      } finally {
+        emitAudioEnd();
+        stream.off('message', handleChunk);
+        stream.off('error', handleStreamErrorEvent);
+        stream.off('abort', handleStreamAbortEvent);
+      }
     } catch (error) {
       console.error('Cartesia TTS streaming failed', error);
       socket.send(
