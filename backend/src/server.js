@@ -18,6 +18,11 @@ const CARTESIA_TTS_MODEL = process.env.CARTESIA_TTS_MODEL || 'sonic-en-v1';
 const CARTESIA_VOICE_ID = process.env.CARTESIA_VOICE_ID || 'alloy';
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
 
+// ===== TEST AUDIO OUTPUT CONFIG =====
+const ENABLE_CARTESIA_TTS_FILE_OUTPUT = true;
+const CARTESIA_TTS_FILE_OUTPUT_DIRECTORY = path.resolve(__dirname, '..');
+// ===== END TEST AUDIO OUTPUT CONFIG =====
+
 if (!process.env.CARTESIA_API_KEY) {
   console.warn('Missing CARTESIA_API_KEY in environment');
 }
@@ -257,6 +262,19 @@ wss.on('connection', async (socket) => {
       const outputEncoding = stream?.source?.encoding || stream?.encoding || 'pcm_s16le';
       const outputSampleRate = stream?.source?.sampleRate || CARTESIA_TTS_SAMPLE_RATE;
 
+      let testOutputStream = null;
+      if (ENABLE_CARTESIA_TTS_FILE_OUTPUT) {
+        const uniqueId = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+        const filename = `cartesia-tts-test-${uniqueId}.pcm`;
+        const filepath = path.join(CARTESIA_TTS_FILE_OUTPUT_DIRECTORY, filename);
+        try {
+          testOutputStream = fs.createWriteStream(filepath);
+          console.log(`Writing Cartesia TTS audio to ${filepath}`);
+        } catch (error) {
+          console.error('Failed to create Cartesia TTS test output file', error);
+        }
+      }
+
       let sentAudioEnd = false;
       const emitAudioEnd = () => {
         if (sentAudioEnd) {
@@ -289,6 +307,13 @@ wss.on('connection', async (socket) => {
         if (!audioBuffer || !audioBuffer.length) {
           return;
         }
+        if (testOutputStream) {
+          try {
+            testOutputStream.write(audioBuffer);
+          } catch (error) {
+            console.error('Failed to write Cartesia TTS chunk to file', error);
+          }
+        }
         socket.send(
           JSON.stringify({
             type: 'audio_chunk',
@@ -318,6 +343,14 @@ wss.on('connection', async (socket) => {
           const encoding = payload.encoding || outputEncoding;
           const sampleRate =
             payload.sampleRate || payload.sample_rate || outputSampleRate;
+          if (testOutputStream) {
+            try {
+              const chunkBuffer = Buffer.from(payload.data, 'base64');
+              testOutputStream.write(chunkBuffer);
+            } catch (error) {
+              console.error('Failed to write Cartesia TTS payload chunk to file', error);
+            }
+          }
           socket.send(
             JSON.stringify({
               type: 'audio_chunk',
@@ -386,6 +419,9 @@ wss.on('connection', async (socket) => {
         stream.off('message', handleChunk);
         stream.off('error', handleStreamErrorEvent);
         stream.off('abort', handleStreamAbortEvent);
+        if (testOutputStream) {
+          testOutputStream.end();
+        }
       }
     } catch (error) {
       console.error('Cartesia TTS streaming failed', error);
