@@ -11,7 +11,9 @@ const OpenAI = require('openai');
 
 const PORT = Number(process.env.PORT) || 4000;
 const CARTESIA_STT_SAMPLE_RATE = Number(process.env.CARTESIA_STT_SAMPLE_RATE) || 16000;
-const CARTESIA_TTS_SAMPLE_RATE = Number(process.env.CARTESIA_TTS_SAMPLE_RATE) || 24000;
+const CARTESIA_TTS_SAMPLE_RATE = Number(process.env.CARTESIA_TTS_SAMPLE_RATE) || 44100;
+const CARTESIA_TTS_CONTAINER = process.env.CARTESIA_TTS_CONTAINER || 'wav';
+const CARTESIA_TTS_ENCODING = process.env.CARTESIA_TTS_ENCODING || 'pcm_f32le';
 const CARTESIA_LANGUAGE = process.env.CARTESIA_LANGUAGE || 'en';
 const CARTESIA_STT_MODEL = process.env.CARTESIA_STT_MODEL || 'ink-whisper';
 const CARTESIA_TTS_MODEL = process.env.CARTESIA_TTS_MODEL || 'sonic-en-v1';
@@ -23,8 +25,53 @@ const ENABLE_CARTESIA_TTS_FILE_OUTPUT = true;
 const CARTESIA_TTS_FILE_OUTPUT_DIRECTORY = path.resolve(__dirname, '..');
 // ===== END TEST AUDIO OUTPUT CONFIG =====
 
-function createWavFileWriter(filepath, sampleRate, channels = 1) {
-  const bitsPerSample = 16;
+function getBitsPerSampleForEncoding(encoding) {
+  if (!encoding) {
+    return 16;
+  }
+  switch (encoding.toLowerCase()) {
+    case 'pcm_f32le':
+      return 32;
+    case 'pcm_s16le':
+      return 16;
+    default:
+      return 16;
+  }
+}
+
+function createAudioFileWriter(
+  filepath,
+  { container = 'raw', sampleRate, encoding, channels = 1 } = {}
+) {
+  if (container === 'wav') {
+    const stream = fs.createWriteStream(filepath);
+    let closed = false;
+    return {
+      write(buffer) {
+        if (closed || !buffer || !buffer.length) {
+          return;
+        }
+        stream.write(buffer, (error) => {
+          if (error) {
+            console.error('Failed to write Cartesia TTS WAV chunk to file', error);
+          }
+        });
+      },
+      end() {
+        if (closed) {
+          return;
+        }
+        closed = true;
+        stream.end((error) => {
+          if (error) {
+            console.error('Failed to finalize Cartesia TTS WAV file', error);
+          }
+        });
+      },
+    };
+  }
+
+  const bitsPerSample = getBitsPerSampleForEncoding(encoding);
   const byteRate = (sampleRate * channels * bitsPerSample) / 8;
   const blockAlign = (channels * bitsPerSample) / 8;
 
@@ -34,7 +81,7 @@ function createWavFileWriter(filepath, sampleRate, channels = 1) {
   header.write('WAVE', 8);
   header.write('fmt ', 12);
   header.writeUInt32LE(16, 16);
-  header.writeUInt16LE(1, 20);
+  header.writeUInt16LE(bitsPerSample === 32 ? 3 : 1, 20);
   header.writeUInt16LE(channels, 22);
   header.writeUInt32LE(sampleRate, 24);
   header.writeUInt32LE(byteRate, 28);
@@ -52,7 +99,7 @@ function createWavFileWriter(filepath, sampleRate, channels = 1) {
       try {
         fs.closeSync(fd);
       } catch (closeError) {
-        console.error('Failed to close WAV file after open error', closeError);
+        console.error('Failed to close PCM file after open error', closeError);
       }
     }
     throw error;
@@ -77,7 +124,7 @@ function createWavFileWriter(filepath, sampleRate, channels = 1) {
         dataLength += buffer.length;
         fs.writeSync(fd, buffer);
       } catch (error) {
-        console.error('Failed to write Cartesia TTS chunk to WAV file', error);
+        console.error('Failed to write Cartesia TTS PCM chunk to file', error);
       }
     },
     end() {
@@ -88,11 +135,11 @@ function createWavFileWriter(filepath, sampleRate, channels = 1) {
       try {
         finalizeHeader();
       } catch (error) {
-        console.error('Failed to finalize Cartesia TTS WAV header', error);
+        console.error('Failed to finalize Cartesia TTS PCM header', error);
       }
       fs.close(fd, (closeError) => {
         if (closeError) {
-          console.error('Failed to close Cartesia TTS WAV file', closeError);
+          console.error('Failed to close Cartesia TTS PCM file', closeError);
         }
       });
     },
@@ -134,8 +181,8 @@ wss.on('connection', async (socket) => {
 
   const ttsWs = cartesia.tts.websocket({
     sampleRate: CARTESIA_TTS_SAMPLE_RATE,
-    container: 'raw',
-    encoding: 'pcm_s16le',
+    container: CARTESIA_TTS_CONTAINER,
+    encoding: CARTESIA_TTS_ENCODING,
   });
 
   let sttWs;
@@ -335,8 +382,12 @@ wss.on('connection', async (socket) => {
         voice: { mode: 'id', id: CARTESIA_VOICE_ID },
       });
 
-      const outputEncoding = stream?.source?.encoding || stream?.encoding || 'pcm_s16le';
-      const outputSampleRate = stream?.source?.sampleRate || CARTESIA_TTS_SAMPLE_RATE;
+      const outputContainer =
+        stream?.source?.container || stream?.container || CARTESIA_TTS_CONTAINER;
+      const outputEncoding =
+        stream?.source?.encoding || stream?.encoding || CARTESIA_TTS_ENCODING;
+      const outputSampleRate =
+        stream?.source?.sampleRate || stream?.sampleRate || CARTESIA_TTS_SAMPLE_RATE;
 
       let testOutputFile = null;
       if (ENABLE_CARTESIA_TTS_FILE_OUTPUT) {
@@ -344,7 +395,11 @@ wss.on('connection', async (socket) => {
         const filename = `cartesia-tts-test-${uniqueId}.wav`;
         const filepath = path.join(CARTESIA_TTS_FILE_OUTPUT_DIRECTORY, filename);
         try {
-          testOutputFile = createWavFileWriter(filepath, outputSampleRate);
+          testOutputFile = createAudioFileWriter(filepath, {
+            container: outputContainer,
+            encoding: outputEncoding,
+            sampleRate: outputSampleRate,
+          });
           console.log(`Writing Cartesia TTS audio to ${filepath}`);
         } catch (error) {
           console.error('Failed to create Cartesia TTS WAV test output file', error);
@@ -377,21 +432,53 @@ wss.on('connection', async (socket) => {
       });
 
       const forwardAudioChunk = (
-        audioBuffer,
-        { encoding = outputEncoding, sampleRate = outputSampleRate } = {}
+        audioData,
+        {
+          encoding = outputEncoding,
+          sampleRate = outputSampleRate,
+          container = outputContainer,
+        } = {}
       ) => {
-        if (!audioBuffer || !audioBuffer.length) {
+        let buffer;
+        let base64Audio;
+
+        if (typeof audioData === 'string') {
+          if (!audioData.length) {
+            return;
+          }
+          base64Audio = audioData;
+          try {
+            buffer = Buffer.from(audioData, 'base64');
+          } catch (error) {
+            console.error('Failed to decode base64 Cartesia TTS chunk', error);
+          }
+        } else if (audioData instanceof ArrayBuffer) {
+          if (!audioData.byteLength) {
+            return;
+          }
+          buffer = Buffer.from(audioData);
+          base64Audio = buffer.toString('base64');
+        } else if (Buffer.isBuffer(audioData)) {
+          if (!audioData.length) {
+            return;
+          }
+          buffer = audioData;
+          base64Audio = audioData.toString('base64');
+        } else {
           return;
         }
-        if (testOutputFile) {
-          testOutputFile.write(audioBuffer);
+
+        if (buffer && buffer.length && testOutputFile) {
+          testOutputFile.write(buffer);
         }
+
         socket.send(
           JSON.stringify({
             type: 'audio_chunk',
-            audio: audioBuffer.toString('base64'),
+            audio: base64Audio,
             sampleRate,
             encoding,
+            container,
           })
         );
       };
@@ -415,22 +502,8 @@ wss.on('connection', async (socket) => {
           const encoding = payload.encoding || outputEncoding;
           const sampleRate =
             payload.sampleRate || payload.sample_rate || outputSampleRate;
-          if (testOutputFile) {
-            try {
-              const chunkBuffer = Buffer.from(payload.data, 'base64');
-              testOutputFile.write(chunkBuffer);
-            } catch (error) {
-              console.error('Failed to write Cartesia TTS payload chunk to WAV file', error);
-            }
-          }
-          socket.send(
-            JSON.stringify({
-              type: 'audio_chunk',
-              audio: payload.data,
-              sampleRate,
-              encoding,
-            })
-          );
+          const container = payload.container || outputContainer;
+          forwardAudioChunk(payload.data, { encoding, sampleRate, container });
         } else if (payload.done) {
           resolveCompletion();
         } else if (payload.type === 'error') {
