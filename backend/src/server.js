@@ -51,31 +51,79 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 wss.on('connection', async (socket) => {
   const cartesia = new CartesiaClient({ apiKey: process.env.CARTESIA_API_KEY });
 
-  const sttWs = cartesia.stt.websocket({
-    model: CARTESIA_STT_MODEL,
-    language: CARTESIA_LANGUAGE,
-    encoding: 'pcm_s16le',
-    sampleRate: CARTESIA_STT_SAMPLE_RATE,
-  });
-
   const ttsWs = cartesia.tts.websocket({
     sampleRate: CARTESIA_TTS_SAMPLE_RATE,
     container: 'raw',
     encoding: 'pcm_s16le',
   });
 
+  let sttWs;
+  let sttReady = Promise.resolve();
   let closed = false;
   const conversation = [{ role: 'system', content: systemPrompt }];
   let processingQueue = Promise.resolve();
+
+  const handleSttMessage = (message) => {
+    if (closed) {
+      return;
+    }
+    if (message.type === 'transcript') {
+      socket.send(
+        JSON.stringify({
+          type: message.isFinal ? 'stt-final' : 'stt-interim',
+          text: message.text,
+        })
+      );
+      if (message.isFinal && message.text.trim()) {
+        processingQueue = processingQueue
+          .then(() => handleFinalTranscript(message.text.trim()))
+          .catch((error) => {
+            console.error('Failed to handle transcript', error);
+          });
+      }
+    } else if (message.type === 'error') {
+      socket.send(
+        JSON.stringify({
+          type: 'stt-error',
+          message: message.message || 'Unknown STT error',
+        })
+      );
+    }
+  };
+
+  async function initializeSttStream() {
+    if (closed) {
+      return;
+    }
+
+    const stream = cartesia.stt.websocket({
+      model: CARTESIA_STT_MODEL,
+      language: CARTESIA_LANGUAGE,
+      encoding: 'pcm_s16le',
+      sampleRate: CARTESIA_STT_SAMPLE_RATE,
+    });
+
+    sttWs = stream;
+
+    try {
+      await stream.connect();
+      await stream.onMessage(handleSttMessage);
+    } catch (error) {
+      sttWs = undefined;
+      throw error;
+    }
+  }
 
   const cleanup = () => {
     if (closed) return;
     closed = true;
     try {
-      sttWs.disconnect();
+      sttWs && sttWs.disconnect();
     } catch (error) {
       console.error('Failed to disconnect STT websocket', error);
     }
+    sttWs = undefined;
+    sttReady = Promise.resolve();
     try {
       ttsWs.disconnect();
     } catch (error) {
@@ -90,34 +138,11 @@ wss.on('connection', async (socket) => {
   });
 
   try {
-    await Promise.all([sttWs.connect(), ttsWs.connect()]);
-    await sttWs.onMessage((message) => {
-      if (closed) {
-        return;
-      }
-      if (message.type === 'transcript') {
-        socket.send(
-          JSON.stringify({
-            type: message.isFinal ? 'stt-final' : 'stt-interim',
-            text: message.text,
-          })
-        );
-        if (message.isFinal && message.text.trim()) {
-          processingQueue = processingQueue.then(() => handleFinalTranscript(message.text.trim())).catch((error) => {
-            console.error('Failed to handle transcript', error);
-          });
-        }
-      } else if (message.type === 'error') {
-        socket.send(
-          JSON.stringify({
-            type: 'stt-error',
-            message: message.message || 'Unknown STT error',
-          })
-        );
-      }
-    });
+    sttReady = initializeSttStream();
+    await Promise.all([sttReady, ttsWs.connect()]);
   } catch (error) {
     console.error('Failed to connect to Cartesia streaming services', error);
+    sttReady.catch(() => {});
     socket.send(
       JSON.stringify({
         type: 'server-error',
@@ -143,15 +168,40 @@ wss.on('connection', async (socket) => {
     if (parsed.type === 'audio_chunk' && parsed.audio) {
       const buffer = Buffer.from(parsed.audio, 'base64');
       try {
+        await sttReady;
+        if (!sttWs) {
+          return;
+        }
         await sttWs.send(buffer);
       } catch (error) {
         console.error('Failed to forward audio chunk to Cartesia STT', error);
       }
     } else if (parsed.type === 'audio_end') {
       try {
-        await sttWs.finalize();
+        await sttReady;
       } catch (error) {
-        console.error('Failed to finalize STT stream', error);
+        console.error('STT stream was not ready to finalize', error);
+      }
+
+      if (sttWs) {
+        try {
+          await sttWs.finalize();
+        } catch (error) {
+          console.error('Failed to finalize STT stream', error);
+        }
+      }
+
+      if (!closed) {
+        sttReady = initializeSttStream();
+        sttReady.catch((error) => {
+          console.error('Failed to restart STT stream', error);
+          socket.send(
+            JSON.stringify({
+              type: 'server-error',
+              message: 'Failed to restart speech recognition',
+            })
+          );
+        });
       }
     }
   });
@@ -204,25 +254,80 @@ wss.on('connection', async (socket) => {
         voice: { mode: 'id', id: CARTESIA_VOICE_ID },
       });
 
-      const handleChunk = (message) => {
+      let sentAudioEnd = false;
+      const emitAudioEnd = () => {
+        if (sentAudioEnd) {
+          return;
+        }
+        sentAudioEnd = true;
+        socket.send(
+          JSON.stringify({
+            type: 'audio_end',
+          })
+        );
+      };
+
+      const forwardAudioChunk = (audioBuffer) => {
+        if (!audioBuffer || !audioBuffer.length) {
+          return;
+        }
+        socket.send(
+          JSON.stringify({
+            type: 'audio_chunk',
+            audio: audioBuffer.toString('base64'),
+            sampleRate: CARTESIA_TTS_SAMPLE_RATE,
+            encoding: 'pcm_s16le',
+          })
+        );
+      };
+
+      const handlePayload = (payload) => {
+        if (!payload) {
+          return;
+        }
+        if (payload.type === 'chunk' && payload.data) {
+          socket.send(
+            JSON.stringify({
+              type: 'audio_chunk',
+              audio: payload.data,
+              sampleRate: CARTESIA_TTS_SAMPLE_RATE,
+              encoding: 'pcm_s16le',
+            })
+          );
+        } else if (payload.done) {
+          emitAudioEnd();
+          stream.off('message', handleChunk);
+        } else if (payload.type === 'error') {
+          console.error('TTS stream error', payload.message);
+          emitAudioEnd();
+          stream.off('message', handleChunk);
+        }
+      };
+
+      const handleChunk = (incoming) => {
         try {
-          const payload = JSON.parse(message);
-          if (payload.type === 'chunk' && payload.data) {
-            socket.send(
-              JSON.stringify({
-                type: 'audio_chunk',
-                audio: payload.data,
-                sampleRate: CARTESIA_TTS_SAMPLE_RATE,
-                encoding: 'pcm_s16le',
-              })
-            );
-          } else if (payload.done) {
-            socket.send(
-              JSON.stringify({
-                type: 'audio_end',
-              })
-            );
-            stream.off('message', handleChunk);
+          let message = incoming;
+          if (message instanceof ArrayBuffer) {
+            message = Buffer.from(message);
+          }
+
+          if (Buffer.isBuffer(message)) {
+            if (!message.length) {
+              return;
+            }
+            const text = message.toString('utf8');
+            const trimmed = text.trimStart();
+            if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+              handlePayload(JSON.parse(text));
+            } else {
+              forwardAudioChunk(message);
+            }
+          } else if (typeof message === 'string') {
+            const trimmed = message.trim();
+            if (!trimmed) {
+              return;
+            }
+            handlePayload(JSON.parse(trimmed));
           }
         } catch (error) {
           console.error('Failed to process TTS chunk', error);
@@ -231,6 +336,7 @@ wss.on('connection', async (socket) => {
 
       stream.on('message', handleChunk);
       await stream.once('close');
+      emitAudioEnd();
       stream.off('message', handleChunk);
     } catch (error) {
       console.error('Cartesia TTS streaming failed', error);
