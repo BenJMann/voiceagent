@@ -181,10 +181,19 @@ export default function App() {
         case 'audio_chunk': {
           const audioContext = await ensurePlaybackContext();
           const arrayBuffer = base64ToArrayBuffer(payload.audio);
-          const int16 = new Int16Array(arrayBuffer);
-          const float32 = new Float32Array(int16.length);
-          for (let i = 0; i < int16.length; i += 1) {
-            float32[i] = int16[i] / 0x7fff;
+          const encoding = payload.encoding || 'pcm_s16le';
+          let float32;
+          if (encoding === 'pcm_s16le') {
+            const int16 = new Int16Array(arrayBuffer);
+            float32 = new Float32Array(int16.length);
+            for (let i = 0; i < int16.length; i += 1) {
+              float32[i] = int16[i] / 0x7fff;
+            }
+          } else if (encoding === 'pcm_f32le') {
+            float32 = new Float32Array(arrayBuffer);
+          } else {
+            console.warn('Unsupported audio encoding from server', encoding);
+            break;
           }
           const sampleRate = payload.sampleRate || audioContext.sampleRate;
           const buffer = audioContext.createBuffer(1, float32.length, sampleRate);

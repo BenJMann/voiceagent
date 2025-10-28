@@ -254,6 +254,9 @@ wss.on('connection', async (socket) => {
         voice: { mode: 'id', id: CARTESIA_VOICE_ID },
       });
 
+      const outputEncoding = stream?.source?.encoding || stream?.encoding || 'pcm_s16le';
+      const outputSampleRate = stream?.source?.sampleRate || CARTESIA_TTS_SAMPLE_RATE;
+
       let sentAudioEnd = false;
       const emitAudioEnd = () => {
         if (sentAudioEnd) {
@@ -279,7 +282,10 @@ wss.on('connection', async (socket) => {
         };
       });
 
-      const forwardAudioChunk = (audioBuffer) => {
+      const forwardAudioChunk = (
+        audioBuffer,
+        { encoding = outputEncoding, sampleRate = outputSampleRate } = {}
+      ) => {
         if (!audioBuffer || !audioBuffer.length) {
           return;
         }
@@ -287,8 +293,8 @@ wss.on('connection', async (socket) => {
           JSON.stringify({
             type: 'audio_chunk',
             audio: audioBuffer.toString('base64'),
-            sampleRate: CARTESIA_TTS_SAMPLE_RATE,
-            encoding: 'pcm_s16le',
+            sampleRate,
+            encoding,
           })
         );
       };
@@ -309,14 +315,17 @@ wss.on('connection', async (socket) => {
           return;
         }
         if (payload.type === 'chunk' && payload.data) {
+          const encoding = payload.encoding || outputEncoding;
+          const sampleRate =
+            payload.sampleRate || payload.sample_rate || outputSampleRate;
           socket.send(
             JSON.stringify({
               type: 'audio_chunk',
               audio: payload.data,
-              sampleRate: CARTESIA_TTS_SAMPLE_RATE,
-            encoding: 'pcm_s16le',
-          })
-        );
+              sampleRate,
+              encoding,
+            })
+          );
         } else if (payload.done) {
           resolveCompletion();
         } else if (payload.type === 'error') {
