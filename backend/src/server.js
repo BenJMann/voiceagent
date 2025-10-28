@@ -254,6 +254,9 @@ wss.on('connection', async (socket) => {
         voice: { mode: 'id', id: CARTESIA_VOICE_ID },
       });
 
+      const outputEncoding = stream?.source?.encoding || stream?.encoding || 'pcm_s16le';
+      const outputSampleRate = stream?.source?.sampleRate || CARTESIA_TTS_SAMPLE_RATE;
+
       let sentAudioEnd = false;
       const emitAudioEnd = () => {
         if (sentAudioEnd) {
@@ -267,7 +270,22 @@ wss.on('connection', async (socket) => {
         );
       };
 
-      const forwardAudioChunk = (audioBuffer) => {
+      let completionResolved = false;
+      let resolveCompletion;
+      const completion = new Promise((resolve) => {
+        resolveCompletion = () => {
+          if (completionResolved) {
+            return;
+          }
+          completionResolved = true;
+          resolve();
+        };
+      });
+
+      const forwardAudioChunk = (
+        audioBuffer,
+        { encoding = outputEncoding, sampleRate = outputSampleRate } = {}
+      ) => {
         if (!audioBuffer || !audioBuffer.length) {
           return;
         }
@@ -275,10 +293,21 @@ wss.on('connection', async (socket) => {
           JSON.stringify({
             type: 'audio_chunk',
             audio: audioBuffer.toString('base64'),
-            sampleRate: CARTESIA_TTS_SAMPLE_RATE,
-            encoding: 'pcm_s16le',
+            sampleRate,
+            encoding,
           })
         );
+      };
+
+      const handleStreamErrorEvent = (error) => {
+        if (error) {
+          console.error('TTS stream error event', error);
+        }
+        resolveCompletion();
+      };
+
+      const handleStreamAbortEvent = () => {
+        resolveCompletion();
       };
 
       const handlePayload = (payload) => {
@@ -286,21 +315,22 @@ wss.on('connection', async (socket) => {
           return;
         }
         if (payload.type === 'chunk' && payload.data) {
+          const encoding = payload.encoding || outputEncoding;
+          const sampleRate =
+            payload.sampleRate || payload.sample_rate || outputSampleRate;
           socket.send(
             JSON.stringify({
               type: 'audio_chunk',
               audio: payload.data,
-              sampleRate: CARTESIA_TTS_SAMPLE_RATE,
-              encoding: 'pcm_s16le',
+              sampleRate,
+              encoding,
             })
           );
         } else if (payload.done) {
-          emitAudioEnd();
-          stream.off('message', handleChunk);
+          resolveCompletion();
         } else if (payload.type === 'error') {
           console.error('TTS stream error', payload.message);
-          emitAudioEnd();
-          stream.off('message', handleChunk);
+          resolveCompletion();
         }
       };
 
@@ -335,9 +365,28 @@ wss.on('connection', async (socket) => {
       };
 
       stream.on('message', handleChunk);
-      await stream.once('close');
-      emitAudioEnd();
-      stream.off('message', handleChunk);
+      stream.on('error', handleStreamErrorEvent);
+      stream.on('abort', handleStreamAbortEvent);
+
+      const waitForSourceClose = stream.source && typeof stream.source.once === 'function'
+        ? stream.source.once('close')
+        : stream.once('close');
+
+      waitForSourceClose.then(resolveCompletion).catch((error) => {
+        if (error) {
+          console.error('TTS stream source close error', error);
+        }
+        resolveCompletion();
+      });
+
+      try {
+        await completion;
+      } finally {
+        emitAudioEnd();
+        stream.off('message', handleChunk);
+        stream.off('error', handleStreamErrorEvent);
+        stream.off('abort', handleStreamAbortEvent);
+      }
     } catch (error) {
       console.error('Cartesia TTS streaming failed', error);
       socket.send(
